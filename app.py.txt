@@ -1,0 +1,113 @@
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+import plotly.express as px
+from openai import OpenAI
+import json
+
+st.set_page_config(page_title="TP Investor Analytics", page_icon="📈", layout="wide")
+st.title("📈 დამოუკიდებელი ინვესტორის ასისტენტი")
+st.caption("აქციებისა და ETF ფონდების ანალიზი, პორტფელის მონიტორინგი და AI შეფასება")
+
+st.sidebar.header("⚙️ პარამეტრები & API")
+openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password")
+
+if 'portfolio' not in st.session_state:
+    st.session_state.portfolio = [
+        {"Ticker": "NVDA", "Shares": 10, "Avg_Price": 120.0},
+        {"Ticker": "MSFT", "Shares": 5, "Avg_Price": 400.0},
+        {"Ticker": "SOXX", "Shares": 8, "Avg_Price": 220.0}
+    ]
+
+@st.cache_data(ttl=3600)
+def get_stock_data(ticker_symbol):
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        info = ticker.info
+        hist = ticker.history(period="1y")
+        if hist.empty: return None
+        current_price = hist['Close'].iloc[-1]
+        prev_price = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
+        daily_change = ((current_price - prev_price) / prev_price) * 100
+        pe_ratio = info.get('trailingPE', None)
+        peg_ratio = info.get('pegRatio', None)
+        delta = hist['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs.iloc[-1])) if not pd.isna(rs.iloc[-1]) else 50
+        ma_50 = hist['Close'].rolling(window=50).mean().iloc[-1]
+        return {
+            "current_price": current_price, "daily_change": daily_change,
+            "pe_ratio": pe_ratio, "peg_ratio": peg_ratio, "rsi": rsi, "ma_50": ma_50,
+            "history": hist, "long_name": info.get('longName', ticker_symbol)
+        }
+    except: return None
+
+tab1, tab2, tab3 = st.tabs(["📊 ჩემი პორტფელი", "🔍 ინდივიდუალური ანალიზი", "🤖 AI საფონდო ასისტენტი"])
+
+with tab1:
+    st.header("💼 პორტფელის მენეჯმენტი")
+    with st.expander("➕ ახალი აქციის/ETF-ის დამატება"):
+        col1, col2, col3 = st.columns(3)
+        with col1: new_ticker = st.text_input("ტიკერი:").upper().strip()
+        with col2: new_shares = st.number_input("რაოდენობა:", min_value=0.0, step=1.0)
+        with col3: new_price = st.number_input("ფასი ($):", min_value=0.0, step=0.1)
+        if st.button("პორტფელში დამატება"):
+            if new_ticker:
+                st.session_state.portfolio.append({"Ticker": new_ticker, "Shares": new_shares, "Avg_Price": new_price})
+                st.rerun()
+    if st.session_state.portfolio:
+        portfolio_data = []
+        total_value, total_cost = 0.0, 0.0
+        for item in st.session_state.portfolio:
+            data = get_stock_data(item["Ticker"])
+            if data:
+                current_val = data["current_price"] * item["Shares"]
+                cost_val = item["Avg_Price"] * item["Shares"]
+                profit_loss = current_val - cost_val
+                profit_loss_pct = (profit_loss / cost_val) * 100 if cost_val > 0 else 0
+                pe = data["pe_ratio"]
+                fund_status = "Undervalued 🟢" if pe and pe < 15 else ("Overvalued 🔴" if pe and pe > 30 else "Fair Value 🟡")
+                rsi = data["rsi"]
+                tech_status = "Oversold 🟢" if rsi < 30 else ("Overbought 🔴" if rsi > 70 else "Neutral 🟡")
+                portfolio_data.append({
+                    "ტიკერი": item["Ticker"], "კომპანია": data["long_name"], "რაოდენობა": item["Shares"],
+                    "შესყიდვის ფასი ($)": f"${item['Avg_Price']:.2f}", "მიმდინარე ფასი ($)": f"${data['current_price']:.2f}",
+                    "მოგება/ზარალი ($)": f"${profit_loss:.2f}", "მოგება/ზარალი (%)": f"{profit_loss_pct:.2f}%",
+                    "ფუნდამენტური შეფასება": fund_status, "ტექნიკური სტატუსი": tech_status
+                })
+                total_value += current_val
+                total_cost += cost_val
+        m1, m2, m3 = st.columns(3)
+        m1.metric("პორტფელის ღირებულება", f"${total_value:,.2f}")
+        m2.metric("ჯამური ინვესტიცია", f"${total_cost:,.2f}")
+        m3.metric("მოგება/ზარალი", f"${(total_value - total_cost):,.2f}")
+        st.dataframe(pd.DataFrame(portfolio_data), use_container_width=True)
+
+with tab2:
+    st.header("🔍 ინდივიდუალური ანალიზი")
+    search_ticker = st.text_input("შეიყვანეთ საძიებო ტიკერი:", "AAPL").upper().strip()
+    if search_ticker:
+        data = get_stock_data(search_ticker)
+        if data:
+            st.subheader(f"{data['long_name']} ({search_ticker})")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("ფასი", f"${data['current_price']:.2f}", f"{data['daily_change']:.2f}%")
+            c2.metric("P/E კოეფიციენტი", f"{data['pe_ratio']}" if data['pe_ratio'] else "N/A")
+            c3.metric("RSI (14 დღე)", f"{data['rsi']:.2f}")
+            fig = px.line(data["history"], x=data["history"].index, y="Close")
+            st.plotly_chart(fig, use_container_width=True)
+
+with tab3:
+    st.header("🤖 AI ფინანსური ანალიტიკოსი")
+    if not openai_api_key: st.info("გთხოვთ, შეიყვანოთ თქვენი OpenAI API Key მარცხენა მენიუში.")
+    else:
+        if st.button("პორტფელის AI ანალიზი"):
+            client = OpenAI(api_key=openai_api_key)
+            with st.spinner("AI მუშაობს..."):
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": "user", "content": f"გააანალიზე ეს პორტფელი ქართულად: {json.dumps(st.session_state.portfolio)}"}]
+                )
+                st.write(response.choices[0].message.content)
